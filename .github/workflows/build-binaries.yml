@@ -1,0 +1,182 @@
+name: Build Binaries
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-source:
+    runs-on: ubuntu-latest
+    outputs:
+      SMARTMONTOOLS_PKG_VER: ${{ steps.version.outputs.SMARTMONTOOLS_PKG_VER }}
+      SMARTMONTOOLS_GIT_REV_EPOCH: ${{ steps.version.outputs.SMARTMONTOOLS_GIT_REV_EPOCH }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y automake build-essential
+
+      - name: Prepare versioning
+        id: version
+        run: |
+          cd smartmontools
+          PKG_VER=$(./getversion.sh -p)
+          GIT_REV_EPOCH=$(git log -1 --format=%at)
+          echo "SMARTMONTOOLS_PKG_VER=${PKG_VER}" >> $GITHUB_OUTPUT
+          echo "SMARTMONTOOLS_GIT_REV_EPOCH=${GIT_REV_EPOCH}" >> $GITHUB_OUTPUT
+
+      - name: Build Tarball
+        run: |
+          cd smartmontools
+          ./autogen.sh
+          cd ..
+          tar -czf smartmontools-src.tar.gz smartmontools/
+
+      - name: Upload Source Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: smartmontools-src
+          path: smartmontools-src.tar.gz
+
+  build-linux:
+    needs: build-source
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            os: ubuntu-latest
+          - arch: aarch64
+            os: ubuntu-24.04-arm
+    steps:
+      - name: Download source artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: smartmontools-src
+
+      - name: Extract source
+        run: tar -xzf smartmontools-src.tar.gz
+
+      - name: Build
+        env:
+          GIT_REV_EPOCH: ${{ needs.build-source.outputs.SMARTMONTOOLS_GIT_REV_EPOCH }}
+        run: |
+          cd smartmontools
+          ./configure --with-build-info="(GHA/static)" \
+            LDFLAGS="-static-libstdc++ -static-libgcc" \
+            --without-libcap-ng --without-libsystemd \
+            SOURCE_DATE_EPOCH=$((GIT_REV_EPOCH + 1))
+          make -j$(nproc)
+          make check
+          mkdir -p ../dist
+          cp smartctl smartd ../dist/
+          cd ../dist
+          tar -czf ../smartmontools-linux-${{ matrix.arch }}.tar.gz *
+
+      - name: Upload Binary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: smartmontools-linux-${{ matrix.arch }}
+          path: smartmontools-linux-${{ matrix.arch }}.tar.gz
+
+  build-darwin:
+    needs: build-source
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/smartmontools/docker-build:master
+    steps:
+      - name: Download source artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: smartmontools-src
+
+      - name: Extract source
+        run: tar -xzf smartmontools-src.tar.gz
+
+      - name: Build
+        env:
+          GIT_REV_EPOCH: ${{ needs.build-source.outputs.SMARTMONTOOLS_GIT_REV_EPOCH }}
+        run: |
+          export PATH="/usr/osxcross/bin/:$PATH"
+          export LD_LIBRARY_PATH=/usr/osxcross/lib
+          cd smartmontools
+          ./configure --build=$(./config.guess) --host=x86_64-apple-darwin20.4 \
+            --with-build-info="(GHA/static)" \
+            --sysconfdir=/private/etc CC=o64-clang CXX=o64-clang++ \
+            CFLAGS="-arch arm64 -arch x86_64" \
+            CXXFLAGS="-arch arm64 -arch x86_64 -stdlib=libc++" \
+            SOURCE_DATE_EPOCH=$((GIT_REV_EPOCH + 1))
+          make -j$(nproc)
+          mkdir -p ../dist
+          cp smartctl smartd ../dist/
+          cd ../dist
+          tar -czf ../smartmontools-darwin.tar.gz *
+
+      - name: Upload Binary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: smartmontools-darwin
+          path: smartmontools-darwin.tar.gz
+
+  build-windows:
+    needs: build-source
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/smartmontools/docker-build:master
+    steps:
+      - name: Download source artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: smartmontools-src
+
+      - name: Extract source
+        run: tar -xzf smartmontools-src.tar.gz
+
+      - name: Build
+        env:
+          GIT_REV_EPOCH: ${{ needs.build-source.outputs.SMARTMONTOOLS_GIT_REV_EPOCH }}
+          PKG_VER: ${{ needs.build-source.outputs.SMARTMONTOOLS_PKG_VER }}
+        run: |
+          cd smartmontools
+          ./configure --build=$(./config.guess) --host=x86_64-w64-mingw32 \
+            --with-build-info="(GHA/static)" \
+            SOURCE_DATE_EPOCH=$((GIT_REV_EPOCH + 1))
+          make -j$(nproc)
+          mkdir -p ../dist/bin ../dist/doc
+          cp smartctl.exe smartd.exe ../dist/bin/
+          cp os_win32/smartd_mailer.ps1 os_win32/smartd_warning.cmd ../dist/bin/ 2>/dev/null || true
+          cp AUTHORS ChangeLog COPYING INSTALL NEWS README TODO smartd.conf ../dist/doc/ 2>/dev/null || true
+          cd ../dist
+          tar -czf ../smartmontools-windows-x86_64.tar.gz *
+
+      - name: Upload Binary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: smartmontools-windows-x86_64
+          path: smartmontools-windows-x86_64.tar.gz
+
+  release:
+    name: Create Release
+    needs: [build-linux, build-darwin, build-windows, build-source]
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ needs.build-source.outputs.SMARTMONTOOLS_PKG_VER }}"
+          TAG_NAME="v${VERSION}-$(date +'%Y%m%d%H%M')"
+          gh release create "$TAG_NAME" artifacts/* \
+            --target "${{ github.ref_name }}" \
+            --title "Release ${VERSION}" \
